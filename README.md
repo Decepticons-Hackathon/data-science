@@ -18,7 +18,7 @@
 
 **Файлы для взаимодействия с Backend:**
 - py-скрипт:
-- обученная модель:
+- обученная модель: [`best_model`](https://github.com/Decepticons-Hackathon/data-science/blob/main/script/pickle_model.pkl)
 
 ## Задачи в DS:
 - Анализ данных (все);
