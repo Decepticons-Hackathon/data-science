@@ -1,159 +1,176 @@
-#!/usr/bin/env python
-# coding: utf-8
+import re
 
-# In[ ]:
-
-
-def match_processing(parser_data, product_data, n_matchs):
-
-  get_ipython().system('pip install fuzzywuzzy -q')
-  get_ipython().system('pip install python-Levenshtein -q')
-
-  import pandas as pd
-  from fuzzywuzzy import fuzz
-  from fuzzywuzzy import process
-  import numpy as np
-  import torch
-  from transformers import AutoTokenizer, AutoModel, logging
-  import re
-  import pickle
-
-  from sklearn.model_selection import train_test_split, GridSearchCV
-  from sklearn.metrics import precision_score
-  from lightgbm import LGBMClassifier
+import numpy as np
+import pandas as pd
+import pickle
+import torch
 
 
-  import warnings
-  warnings.filterwarnings('ignore')
-  logging.set_verbosity_error()
+from fuzzywuzzy import fuzz
+from transformers import AutoTokenizer, AutoModel, logging
 
-  RANDOM_STATE=12345
+logging.set_verbosity_error()
 
 
-#--------------------------------------------------Загружаем предобученную модель--------------------------------------------------------------------
+class recommendation_model:
+    def __init__(self, product_data):
+        self.product_data = pd.DataFrame(product_data)
+        with open('pickle_model.pkl', "rb") as file:
+            unpickler = pickle.Unpickler(file)
+            self.pretrained_model = unpickler.load()
+        self.tokenizer = AutoTokenizer.from_pretrained("cointegrated/rubert-tiny")
+        self.model = AutoModel.from_pretrained("cointegrated/rubert-tiny")
+        
+    def preprocessing_bd(self):
+        self.product_data.dropna(inplace=True)
+        self.product_data['name'] = self.product_data['name'].apply(self.re_name)
+        self.product_data['mera'] = self.product_data['name'].apply(self.add_metering)
+        self.product_data['mera_let'] = self.product_data['mera'].apply(self.find_letters)
+        self.product_data['mera_num'] = self.product_data['mera'].apply(self.find_numbers)
+        self.product_data['name'] = self.product_data['name'].apply(self.replace_kg_and_g)
+        
+        self.product_data.drop(['mera'], axis=1, inplace=True)
+        
+        self.product_data.reset_index(drop=True, inplace=True)
+        
+        tokenized = self.product_data['name'].apply((lambda x: self.tokenizer.encode(x, add_special_tokens=True)))
+        self.max_len = 0
+        for i in tokenized.values:
+            if len(i) > self.max_len:
+                self.max_len = len(i)
 
-  with open('pickle_model.pkl', "rb") as file:
-    unpickler = pickle.Unpickler(file)
-    pretrained_model = unpickler.load()
+        padded = np.array([i + [0]*(self.max_len-len(i)) for i in tokenized.values])
+        attention_mask = np.where(padded != 0, 1, 0)
+        input_ids = torch.tensor(padded)
+        attention_mask = torch.tensor(attention_mask)
+        with torch.no_grad():
+            last_hidden_states = self.model(input_ids, attention_mask=attention_mask)
+        self.product_name_vector = last_hidden_states[0][:,0,:].numpy() #вектор name производителя
+        
+    
+    def result(self, parser_data, n_matchs=5):
+        parser_data = pd.DataFrame(parser_data)
+        parser_data['product_name'] = parser_data['product_name'].apply(self.re_name)
+        
+        parser_data['product_mera'] = parser_data['product_name'].apply(self.add_metering)
+        parser_data['product_mera_let'] = parser_data['product_mera'].apply(self.find_letters)
+        parser_data['product_mera_num'] = parser_data['product_mera'].apply(self.find_numbers)
+        parser_data['product_name'] = parser_data['product_name'].apply(self.replace_kg_and_g)
+        parser_data.drop(['product_mera'], axis=1, inplace=True)
+        
+        #-------Эмбеддинг для признака product_name-------
+        tokenized = parser_data['product_name'].apply((lambda x: self.tokenizer.encode(x, add_special_tokens=True)))
 
- #--------------------------------------------------загружаем данные из csv--------------------------------------------------------------------
+        padded = np.array([i + [0]*(self.max_len-len(i)) for i in tokenized.values])
+        attention_mask = np.where(padded != 0, 1, 0)
+        input_ids = torch.tensor(padded)
+        attention_mask = torch.tensor(attention_mask)
 
-  parser_data = pd.read_csv('/content/marketing_dealerprice.csv', sep=';', index_col='id')
-  product_data = pd.read_csv('/content/marketing_product.csv', sep=';')
+        with torch.no_grad():
+            last_hidden_states = self.model(input_ids, attention_mask=attention_mask)
+        product_dealer_name_vector = last_hidden_states[0][:,0,:].numpy()
+        
+        #-------Скалярное произведение-------
+        scalar = list()
+        for i in range(self.product_name_vector.shape[0]):
+            scalar.append(np.dot(self.product_name_vector[i], product_dealer_name_vector[0]))
+            
+        #-------Объединение таблиц-------
+        df = pd.concat([self.product_data, parser_data.sample(self.product_data.shape[0], replace=True).reset_index(drop=True)], axis=1)
+        df['scalar'] = pd.Series(scalar)
+        df['product_mera_num'] = df['product_mera_num'].astype(float)
+        df['mera_num'] = df['mera_num'].astype(float)
+        
+        to_kg = df.apply(lambda x: self.convert_to_kg(x['product_mera_let'], x['mera_let']), axis=1)
+        to_g = df.apply(lambda x: self.convert_to_g(x['product_mera_let'], x['mera_let']), axis=1)
+        
+        df.loc[to_kg, 'product_mera_num'] /= 1000 
+        df.loc[to_g, 'product_mera_num'] *= 1000 
+        
+        df['let'] = df['product_mera_let'] == df['mera_let']
+        df.loc[to_kg, 'let'] = True
+        df.loc[to_g, 'let'] = True
+        df['let'] = df['let'].astype(int)
+        
+        id_df = df['id']
+        
+        
+        #-------Добавление расстояние Левенштейна-------
+        df['fuzz'] = df.apply(self.fuzzywuzzy_name, axis=1)
+        
+        df = df[['mera_num', 'product_mera_num', 'scalar', 'let', 'fuzz']]
+        
 
-#--------------------------------------------------Функция предобработки текста.--------------------------------------------------------------------
-  def re_name(name):
-    """
-    Функция предобработки текста.
-    Разделяет некоторые слитные слова.
-    мылоPROSEPT -> мыло PROSEPT
-    """
+        #-------Предсказания модели-------
 
-    return re.sub(r'(?<=[а-яa-z])(?=[A-Z])|(?=[а-я])(?<=[A-Za-z])|(?<=[a-z])(?=[0-9])', ' ', str(name))
+        df['pred'] = self.pretrained_model.predict(df)
+        df[['predict_proba_0', 'predict_proba_1']] = self.pretrained_model.predict_proba(df.drop("pred", axis=1))
+        df['product_id'] = id_df
+        df = df.query('pred == 1').sort_values(['predict_proba_1'], ascending=False)
+        return df.product_id.to_list()[:n_matchs]
+    
 
-  parser_data['product_name'] = parser_data['product_name'].apply(re_name)
-  product_data['name'] = product_data['name'].apply(re_name)
-#----------------------------------------------------------------------------------------------------------------------
-#-----------------------------------ВЕКТОРИЗАЦИЯ ПРИЗНАКОВ-------------------------------------------------------------
-  tokenizer = AutoTokenizer.from_pretrained("cointegrated/rubert-tiny")
-  model = AutoModel.from_pretrained("cointegrated/rubert-tiny")
+    
+    #-------Функции предобработки-------   
+    def fuzzywuzzy_name(self, dataframe):
+        """
+        Добавление расстояния Левенштейна
+        """
+        return fuzz.token_set_ratio(dataframe['product_name'], dataframe['name'])
+        
+    def re_name(self, name):
+        """
+        Функция предобработки текста.
+        Разделяет некоторые слитные слова.
+        мылоPROSEPT -> мыло PROSEPT
+        """
+        return re.sub(r'(?<=[а-яa-z])(?=[A-Z])|(?=[а-я])(?<=[A-Za-z])|(?<=[a-z])(?=[0-9])', ' ', name).lower()
+    
+    def add_metering(self, text):
+        """
+        Выделение метрики измерения и условным количеством из названия
+        """
+        try:
+            return re.search(r'(\d{1,}(?:[\.,]\d+)?\s?(л|мл|кг|г))\b', text)[0]
+        except:
+            return 0
+        
+    def find_letters(self, text):
+        """
+        Выделение метрики измерения после обработки текста функцией add_metering
+        """
+        try:
+            return " ".join(re.findall(r'[A-Za-zА-Яа-я]+', text))
+        except:
+            return "not"
+        
+    def find_numbers(self, text):
+        """
+        Выделение числа после обработки текста функцией add_metering
+        """
+        try:
+            numbers = " ".join(re.findall(r'[-+]?(\d+[\.,]\d+|\d+)', text))
+            return numbers.replace(",", ".")
+        except:
+            return 0
+    
+    def convert_to_kg(self, product_mera_let, mera_let):
+        """
+        граммы в кг, мл в литры
+        """
+        return product_mera_let == 'г' and mera_let == 'кг' or product_mera_let == 'мл' and mera_let == 'л'
 
-#--------------------------------- Эмбеддинг для признака name---------------------------------------------------------
-  tokenized = product_data['name'].apply((lambda x: tokenizer.encode(x, add_special_tokens=True)))
-  max_len = 0
-  for i in tokenized.values:
-    if len(i) > max_len:
-      max_len = len(i)
-
-  padded = np.array([i + [0]*(max_len-len(i)) for i in tokenized.values])
-  attention_mask = np.where(padded != 0, 1, 0)
-  input_ids = torch.tensor(padded)
-  attention_mask = torch.tensor(attention_mask)
-  with torch.no_grad():
-    last_hidden_states = model(input_ids, attention_mask=attention_mask)
-  vector_name = last_hidden_states[0][:,0,:].numpy()
-
-#--------------------------------- Эмбеддинг для признака product_name---------------------------------------------------------
-
-  tokenized = parser_data['product_name'].apply((lambda x: tokenizer.encode(x, add_special_tokens=True)))
-  max_len = 0
-  for i in tokenized.values:
-    if len(i) > max_len:
-      max_len = len(i)
-
-  padded = np.array([i + [0]*(max_len-len(i)) for i in tokenized.values])
-  attention_mask = np.where(padded != 0, 1, 0)
-  input_ids = torch.tensor(padded)
-  attention_mask = torch.tensor(attention_mask)
-
-  with torch.no_grad():
-    last_hidden_states = model(input_ids, attention_mask=attention_mask)
-  vector_product_name = last_hidden_states[0][:,0,:].numpy()
-
-#--------------------------------- Скалярное произведение---------------------------------------------------------
-
-  scalar = list()
-  for i in range(vector_name.shape[0]):
-    scalar.append(np.dot(vector_product_name[i], vector_name[i]))
-  product_data['scalar_feach'] = pd.Series(scalar)
-
-#--------------------------------- Объединение датасетов---------------------------------------------------------
-
-  product_data = product_data.fillna(0)
-
-# Удаляем полные дубликаты
-  product_data = product_data.drop_duplicates().reset_index(drop=True)
-  parser_data = parser_data.drop_duplicates().reset_index(drop=True)
-
-# Добавляем кололнку для объединения и заполняем их одинаковым значением(для корректной склейки)
-  product_data['merge'] = 1
-  parser_data['merge'] = 1
-
-# Объединяем таблицы так, чтобы к каждому product_key все товары производителя.
-  union_data = pd.merge_ordered(parser_data,product_data, fill_method = 'ffill',
-                           right_by='id').drop('merge',axis=1).reset_index(drop=True)
-# добавляем расстояние Левенштейна как признак.
-  def fuzzywuzzy_name(dataframe):
-    return fuzz.token_set_ratio(dataframe['product_name'], dataframe['name'])
-  union_data['fuzz'] = union_data.apply(fuzzywuzzy_name, axis=1)
-
-# В таблице ids будут хранится айдишники для сопоставления с предиктивом расстояние левенштейна для ранжирования
-  ids=pd.DataFrame()
-  ids[['product_dealer_id','dealer_id','manufacturer']] =  union_data[['product_key','dealer_id','id']]
-
-# Удаляем лишние айдишники  из датасета с признаками(те что остались нужны, т.к. модель их использует)
-  union_data = union_data[['scalar_feach','dealer_id','id','category_id','fuzz']]
-
-#--------------------------------- Обработка данных предобученной моделью---------------------------------------------------------
-
-  predictions = pd.DataFrame(pretrained_model.predict(union_data))
-  predictions = predictions.rename(columns={0:'is_matching'})
-  predictions_threats = pd.DataFrame(pretrained_model.predict_proba(union_data))
-  predictions_threats = predictions_threats.rename(columns={0:'match_threats'})
-
-#--------------------------------- Обработка полученных предсказаний ---------------------------------------------------------
-
-  matchs = pd.concat((ids,predictions,predictions_threats['match_threats']),axis=1)
-  matchs = matchs[matchs['is_matching'] == 1]
-  final_table = matchs.sort_values(by=['product_dealer_id','dealer_id','match_threats'],
-                                 ascending=True).drop('is_matching',axis=1)
-
-#--------------------------------- обрезка до нужного количества предсказаний. ---------------------------------------------------------
-
-  def to_nmatchs(data):
-    new_data = pd.DataFrame()
-    temp_data = data.set_index(['product_dealer_id','dealer_id'],drop=True)
-    for i in temp_data.index.unique():
-      new_data = pd.concat((new_data,temp_data.loc[i,:].head(n_matchs)))
-    return new_data
-
-  finish = to_nmatchs(final_table)
-#--------------------------------- Убираем не нужные колонки (оставляем только сматченные айдишники) ---------------------------------------------------------
-  finish = finish.drop(['fuzz','match_threats'],axis=1)
-
-#--------------------------------- Убираем не нужные колонки (оставляем только сматченные айдишники) ---------------------------------------------------------
-  finish = finish.to_csv('matched_ids.csv')
-  finish = csv.reader('marketing_product.csv',delimiter = ";")
-
-  return finish
-
+    def convert_to_g(self, product_mera_let, mera_let):
+        """
+        кг в граммы, литры в мл
+        """
+        return product_mera_let == 'кг' and mera_let == 'г' or product_mera_let == 'л' and mera_let == 'мл'
+    
+    def replace_kg_and_g(self, text):
+        """
+        Удаление метрики измерения и количества из названия
+        """
+        try:
+            return re.sub(r'(\d{1,}(?:[\.,]\d+)?\s?(л|мл|кг|г))\b', '', text).rstrip(' ,/')
+        except:
+            return text
